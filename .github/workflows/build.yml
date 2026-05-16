@@ -36,7 +36,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            wget curl tar zstd build-essential python3 rsync file
+            wget curl tar zstd build-essential python3 rsync file binutils
 
       - name: Cache Image Builder
         id: cache-ib
@@ -59,14 +59,98 @@ jobs:
           tar --zstd -xf imagebuilder.tar.zst
           echo "IB_DIR=$(ls -d openwrt-imagebuilder-*/ | head -1 | sed 's|/$||')" >> $GITHUB_ENV
 
-      - name: Add passwall repositories
+      # ──────────────────────────────────────────────────────────────
+      # Качаем passwall .apk файлы в CI и кладём в прошивку
+      # На роутере они установятся без интернета через uci-defaults
+      # ──────────────────────────────────────────────────────────────
+      - name: Download passwall APK packages
         run: |
-          cd "$IB_DIR"
-          printf '\n%s\n%s\n%s\n' \
-            "${{ env.PASSWALL_BASE }}/passwall_luci" \
-            "${{ env.PASSWALL_BASE }}/passwall_packages" \
-            "${{ env.PASSWALL_BASE }}/passwall2" \
-            >> repositories
+          BASE="${{ env.PASSWALL_BASE }}"
+          OUT="files/usr/lib/passwall_offline"
+          mkdir -p "$OUT"
+
+          # Качаем индексы и ищем имена пакетов через strings
+          wget -q "${BASE}/passwall_packages/packages.adb" -O /tmp/pw_pkg.adb || true
+          wget -q "${BASE}/passwall_luci/packages.adb"    -O /tmp/pw_luci.adb || true
+
+          # Функция: найти имя файла пакета в индексе и скачать
+          download_pkg() {
+            local feed_url="$1"
+            local adb="$2"
+            local pkgname="$3"
+
+            # Ищем строку вида "pkgname-version.arch.apk" в бинарном индексе
+            fname=$(strings "$adb" 2>/dev/null \
+              | grep -E "^${pkgname}-[0-9].*\.apk$" \
+              | head -1)
+
+            if [ -z "$fname" ]; then
+              echo "WARN: $pkgname не найден в индексе, пробуем по маске..."
+              # Fallback: пробуем скачать по известным версиям из дампа роутера
+              fname="${pkgname_fallback[$pkgname]}"
+            fi
+
+            if [ -n "$fname" ]; then
+              echo "Скачиваю: $fname"
+              wget -q "${feed_url}/${fname}" -O "${OUT}/${fname}" \
+                && echo "OK: $fname" \
+                || echo "FAIL: $fname"
+            else
+              echo "ERROR: не удалось найти $pkgname"
+            fi
+          }
+
+          # Версии из дампа роутера (fallback если strings не сработает)
+          declare -A pkgname_fallback=(
+            ["chinadns-ng"]="chinadns-ng-2025.08.09-r1.aarch64_cortex-a53.apk"
+            ["dns2socks"]="dns2socks-2.1-r2.aarch64_cortex-a53.apk"
+            ["tcping"]="tcping-0.3-r1.aarch64_cortex-a53.apk"
+            ["luci-app-passwall"]="luci-app-passwall-26.5.11-r1.noarch.apk"
+          )
+
+          download_pkg "${BASE}/passwall_packages" /tmp/pw_pkg.adb "chinadns-ng"
+          download_pkg "${BASE}/passwall_packages" /tmp/pw_pkg.adb "dns2socks"
+          download_pkg "${BASE}/passwall_packages" /tmp/pw_pkg.adb "tcping"
+          download_pkg "${BASE}/passwall_luci"     /tmp/pw_luci.adb "luci-app-passwall"
+
+          echo "--- Скачанные пакеты ---"
+          ls -lh "$OUT/" || echo "Папка пуста!"
+
+          # Проверяем что скачали хотя бы что-то
+          COUNT=$(ls "$OUT/"*.apk 2>/dev/null | wc -l)
+          echo "Всего APK файлов: $COUNT"
+          if [ "$COUNT" -eq 0 ]; then
+            echo "WARN: ни один пакет не скачан — passwall придётся ставить вручную"
+          fi
+
+      # ──────────────────────────────────────────────────────────────
+      # Создаём uci-defaults скрипт установки passwall без интернета
+      # ──────────────────────────────────────────────────────────────
+      - name: Create passwall offline installer
+        run: |
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/55_install_passwall << 'EOF'
+          #!/bin/sh
+          # Устанавливаем passwall из локальных .apk файлов (без интернета)
+          PKGDIR="/usr/lib/passwall_offline"
+
+          if ! ls "${PKGDIR}"/*.apk >/dev/null 2>&1; then
+              logger -t atlanta "passwall_offline: нет пакетов в $PKGDIR"
+              exit 0
+          fi
+
+          logger -t atlanta "Устанавливаем PassWall из локальных пакетов..."
+
+          apk add --allow-untrusted "${PKGDIR}"/*.apk \
+              && logger -t atlanta "PassWall установлен успешно" \
+              || logger -t atlanta "ОШИБКА установки PassWall"
+
+          # Удаляем пакеты после установки (освобождаем место)
+          rm -rf "$PKGDIR"
+
+          exit 0
+          EOF
+          chmod +x files/etc/uci-defaults/55_install_passwall
 
       - name: Inject secrets
         env:
@@ -82,11 +166,12 @@ jobs:
         run: |
           cd "$IB_DIR"
 
+          # Passwall-зависимые пакеты УБРАНЫ из списка —
+          # они запечены как .apk и ставятся на первой загрузке
           PACKAGES="\
           luci luci-ssl \
           luci-app-firewall luci-app-package-manager luci-app-attendedsysupgrade \
-          luci-app-passwall luci-app-zapret \
-          chinadns-ng dns2socks tcping \
+          luci-app-zapret \
           xray-core zapret microsocks \
           -dnsmasq dnsmasq-full \
           curl gzip unzip ip-full \
@@ -101,7 +186,6 @@ jobs:
             PACKAGES="${PACKAGES}" \
             FILES="../files" \
             EXTRA_IMAGE_NAME="atlanta" \
-            APK_FLAGS="--allow-untrusted" \
             2>&1 | tee ../build.log
 
       - name: Collect output
@@ -130,17 +214,19 @@ jobs:
       - name: Summary
         if: always()
         run: |
-          STATUS=${{ job.status }}
-          echo "## Atlanta Router Build ${STATUS}" >> $GITHUB_STEP_SUMMARY
+          echo "## Atlanta Router Build" >> $GITHUB_STEP_SUMMARY
           echo "| | |" >> $GITHUB_STEP_SUMMARY
           echo "|---|---|" >> $GITHUB_STEP_SUMMARY
           echo "| Version | \`${{ env.OPENWRT_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Device  | \`${{ env.DEVICE }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| Run     | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if ls output/*.bin output/*.itb 2>/dev/null | head -1 | grep -q .; then
-            echo "### Output files" >> $GITHUB_STEP_SUMMARY
-            ls -lh output/ 2>/dev/null \
-              | awk 'NR>1 && $NF!="sha256sums.txt" {print "- `"$NF"` ("$5")"}' \
-              >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "### Passwall пакеты (offline)" >> $GITHUB_STEP_SUMMARY
+          ls files/usr/lib/passwall_offline/*.apk 2>/dev/null \
+            | awk -F/ '{print "- `"$NF"`"}' >> $GITHUB_STEP_SUMMARY || \
+            echo "- пакеты не скачались" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Firmware" >> $GITHUB_STEP_SUMMARY
+          ls -lh output/ 2>/dev/null \
+            | awk 'NR>1 && $NF!="sha256sums.txt" {print "- `"$NF"` ("$5")"}' \
+            >> $GITHUB_STEP_SUMMARY || true

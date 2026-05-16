@@ -1,0 +1,19 @@
+#!/bin/sh
+PKGDIR="/usr/lib/offline_pkgs"
+[ -d "$PKGDIR" ] || exit 0
+
+logger -t atlanta "Устанавливаем offline пакеты..."
+
+[ -f "$PKGDIR/chinadns_dns_tcping.tar.gz" ] && \
+    tar xzf "$PKGDIR/chinadns_dns_tcping.tar.gz" -C / 2>/dev/null
+
+[ -f "$PKGDIR/luci_passwall.tar.gz" ] && \
+    tar xzf "$PKGDIR/luci_passwall.tar.gz" -C / 2>/dev/null
+
+for apk in "$PKGDIR"/*.apk; do
+    [ -f "$apk" ] && apk add --allow-untrusted "$apk"
+done
+
+rm -rf "$PKGDIR"
+logger -t atlanta "Offline пакеты установлены"
+exit 0

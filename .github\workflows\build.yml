@@ -1,0 +1,146 @@
+name: Build Atlanta Router Firmware
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'files/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+    inputs:
+      openwrt_version:
+        description: 'OpenWrt version'
+        default: '25.12.3'
+        required: true
+      clean_build:
+        description: 'Без кэша'
+        type: boolean
+        default: false
+
+env:
+  OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.3' }}
+  TARGET: mediatek/filogic
+  DEVICE: zbtlink_zbt-z8103ax-c
+  PASSWALL_BASE: https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-25.12/aarch64_cortex-a53
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            wget curl tar zstd build-essential python3 rsync file
+
+      - name: Cache Image Builder
+        id: cache-ib
+        uses: actions/cache@v4
+        if: ${{ !github.event.inputs.clean_build }}
+        with:
+          path: imagebuilder.tar.zst
+          key: ib-${{ env.OPENWRT_VERSION }}-mediatek-filogic
+
+      - name: Download Image Builder
+        if: steps.cache-ib.outputs.cache-hit != 'true'
+        run: |
+          IB="openwrt-imagebuilder-${{ env.OPENWRT_VERSION }}-mediatek-filogic.Linux-x86_64"
+          wget -q --show-progress -c \
+            "https://downloads.openwrt.org/releases/${{ env.OPENWRT_VERSION }}/targets/${{ env.TARGET }}/${IB}.tar.zst" \
+            -O imagebuilder.tar.zst
+
+      - name: Extract Image Builder
+        run: |
+          tar --zstd -xf imagebuilder.tar.zst
+          echo "IB_DIR=$(ls -d openwrt-imagebuilder-*/ | head -1 | sed 's|/$||')" >> $GITHUB_ENV
+
+      - name: Add passwall repositories
+        run: |
+          cd "$IB_DIR"
+          printf '\n%s\n%s\n%s\n' \
+            "${{ env.PASSWALL_BASE }}/passwall_luci" \
+            "${{ env.PASSWALL_BASE }}/passwall_packages" \
+            "${{ env.PASSWALL_BASE }}/passwall2" \
+            >> repositories
+
+      - name: Inject secrets
+        env:
+          PASSWALL_SUB_URL: ${{ secrets.PASSWALL_SUB_URL }}
+        run: |
+          if [ -n "$PASSWALL_SUB_URL" ] && [ -f files/etc/config/passwall ]; then
+            sed -i "s|__PASSWALL_SUB_URL__|${PASSWALL_SUB_URL}|g" \
+              files/etc/config/passwall
+            echo "passwall URL injected"
+          fi
+
+      - name: Build firmware
+        run: |
+          cd "$IB_DIR"
+
+          PACKAGES="\
+          luci luci-ssl \
+          luci-app-firewall luci-app-package-manager luci-app-attendedsysupgrade \
+          luci-app-passwall luci-app-zapret \
+          chinadns-ng dns2socks tcping \
+          xray-core zapret microsocks \
+          -dnsmasq dnsmasq-full \
+          curl gzip unzip ip-full \
+          coreutils-base64 coreutils-nohup coreutils-sleep coreutils-sort coreutils-od \
+          zram-swap kmod-zram kmod-lib-lzo kmod-crypto-acompress \
+          kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink \
+          libnetfilter-queue1 libnetfilter-conntrack3 \
+          ubi-utils libyaml lyaml libbpf1 libelf1 libgmp10 libcap libnettle8"
+
+          make image \
+            PROFILE="${{ env.DEVICE }}" \
+            PACKAGES="${PACKAGES}" \
+            FILES="../files" \
+            EXTRA_IMAGE_NAME="atlanta" \
+            APK_FLAGS="--allow-untrusted" \
+            2>&1 | tee ../build.log
+
+      - name: Collect output
+        run: |
+          mkdir -p output
+          find "$IB_DIR/bin/targets" \( -name "*.bin" -o -name "*.itb" \) \
+            -exec cp {} output/ \; 2>/dev/null || true
+          sha256sum output/* | tee output/sha256sums.txt
+          ls -lh output/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: atlanta-${{ env.OPENWRT_VERSION }}-r${{ github.run_number }}
+          path: output/
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-r${{ github.run_number }}
+          path: build.log
+          retention-days: 7
+
+      - name: Summary
+        if: always()
+        run: |
+          STATUS=${{ job.status }}
+          echo "## Atlanta Router Build ${STATUS}" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Version | \`${{ env.OPENWRT_VERSION }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Device  | \`${{ env.DEVICE }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Run     | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if ls output/*.bin output/*.itb 2>/dev/null | head -1 | grep -q .; then
+            echo "### Output files" >> $GITHUB_STEP_SUMMARY
+            ls -lh output/ 2>/dev/null \
+              | awk 'NR>1 && $NF!="sha256sums.txt" {print "- `"$NF"` ("$5")"}' \
+              >> $GITHUB_STEP_SUMMARY
+          fi

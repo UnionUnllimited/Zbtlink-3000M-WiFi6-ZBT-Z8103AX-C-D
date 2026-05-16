@@ -21,9 +21,6 @@ env:
   OPENWRT_VERSION: ${{ github.event.inputs.openwrt_version || '25.12.3' }}
   TARGET: mediatek/filogic
   DEVICE: zbtlink_zbt-z8103ax-c
-  ARCH: aarch64_cortex-a53
-  PASSWALL_BASE: https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-25.12/aarch64_cortex-a53
-  OWRT_PKG: https://downloads.openwrt.org/releases/25.12.3/packages/aarch64_cortex-a53
 
 jobs:
   build:
@@ -38,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            wget curl tar zstd build-essential python3 rsync file binutils
+            wget tar zstd build-essential rsync
 
       - name: Cache Image Builder
         id: cache-ib
@@ -61,105 +58,6 @@ jobs:
           tar --zstd -xf imagebuilder.tar.zst
           echo "IB_DIR=$(ls -d openwrt-imagebuilder-*/ | head -1 | sed 's|/$||')" >> $GITHUB_ENV
 
-      # ──────────────────────────────────────────────────────────────
-      # Скачиваем ВСЕ нестандартные пакеты как .apk файлы
-      # Они будут запечены в прошивку и установятся без интернета
-      # ──────────────────────────────────────────────────────────────
-      - name: Download offline APK packages
-        run: |
-          OUT="files/usr/lib/offline_pkgs"
-          mkdir -p "$OUT"
-
-          # Вспомогательная функция: скачать .apk по прямой ссылке
-          get() {
-            local url="$1"
-            local name=$(basename "$url")
-            echo "→ $name"
-            wget -q "$url" -O "$OUT/$name" && echo "  OK" || echo "  FAIL: $url"
-          }
-
-          # Вспомогательная: найти и скачать пакет из packages.adb индекса
-          get_from_feed() {
-            local feed_url="$1"    # URL директории с packages.adb
-            local pkgname="$2"     # имя пакета
-            local arch="$3"        # aarch64_cortex-a53 или noarch
-
-            wget -q "${feed_url}/packages.adb" -O /tmp/feed_idx.adb 2>/dev/null || return 1
-            # Ищем строку filename в бинарном индексе
-            fname=$(strings /tmp/feed_idx.adb 2>/dev/null \
-              | grep -E "^${pkgname}-[0-9].*${arch}\.apk$" | head -1)
-            [ -z "$fname" ] && \
-              fname=$(strings /tmp/feed_idx.adb 2>/dev/null \
-              | grep -E "^${pkgname}-[0-9].*\.apk$" | head -1)
-            if [ -n "$fname" ]; then
-              get "${feed_url}/${fname}"
-            else
-              echo "  NOT FOUND in index: $pkgname @ $feed_url"
-              return 1
-            fi
-          }
-
-          echo "=== PassWall пакеты (passwall feed) ==="
-          PW="${{ env.PASSWALL_BASE }}"
-          # Пробуем найти через индекс, иначе используем точные версии из дампа
-          get_from_feed "${PW}/passwall_packages" "chinadns-ng"       "aarch64_cortex-a53" || \
-            get "${PW}/passwall_packages/chinadns-ng-2025.08.09-r1.aarch64_cortex-a53.apk"
-
-          get_from_feed "${PW}/passwall_packages" "dns2socks"         "aarch64_cortex-a53" || \
-            get "${PW}/passwall_packages/dns2socks-2.1-r2.aarch64_cortex-a53.apk"
-
-          get_from_feed "${PW}/passwall_packages" "tcping"            "aarch64_cortex-a53" || \
-            get "${PW}/passwall_packages/tcping-0.3-r1.aarch64_cortex-a53.apk"
-
-          get_from_feed "${PW}/passwall_luci"     "luci-app-passwall" "noarch" || \
-            get "${PW}/passwall_luci/luci-app-passwall-26.5.11-r1.noarch.apk"
-
-          echo "=== Zapret пакеты (OpenWrt base feed) ==="
-          # zapret из OpenWrt base feed (если есть в 25.12.3)
-          OWRT_BASE="${{ env.OWRT_PKG }}/base"
-          get_from_feed "$OWRT_BASE" "zapret"          "aarch64_cortex-a53" || \
-            echo "  zapret не найден в base feed — пробуем snapshots"
-
-          get_from_feed "$OWRT_BASE" "luci-app-zapret" "noarch" || \
-            echo "  luci-app-zapret не найден в base feed"
-
-          # Fallback: ищем zapret в OpenWrt snapshots
-          SNAP_BASE="https://downloads.openwrt.org/snapshots/packages/aarch64_cortex-a53/base"
-          if ! ls "$OUT/zapret-"*.apk >/dev/null 2>&1; then
-            echo "  Fallback: snapshots feed..."
-            get_from_feed "$SNAP_BASE" "zapret"          "aarch64_cortex-a53" || true
-            get_from_feed "$SNAP_BASE" "luci-app-zapret" "noarch"             || true
-          fi
-
-          echo ""
-          echo "=== Итого ==="
-          ls -lh "$OUT/"
-          echo "Файлов: $(ls "$OUT/"*.apk 2>/dev/null | wc -l)"
-
-      # ──────────────────────────────────────────────────────────────
-      # uci-defaults: установка всех offline пакетов на первой загрузке
-      # ──────────────────────────────────────────────────────────────
-      - name: Create offline installer script
-        run: |
-          mkdir -p files/etc/uci-defaults
-          cat > files/etc/uci-defaults/55_install_offline_pkgs << 'EOF'
-          #!/bin/sh
-          PKGDIR="/usr/lib/offline_pkgs"
-
-          [ -d "$PKGDIR" ] || exit 0
-          ls "${PKGDIR}"/*.apk >/dev/null 2>&1 || { rm -rf "$PKGDIR"; exit 0; }
-
-          logger -t atlanta "Устанавливаем offline пакеты из $PKGDIR..."
-
-          apk add --allow-untrusted "${PKGDIR}"/*.apk \
-              && logger -t atlanta "Offline пакеты установлены" \
-              || logger -t atlanta "ОШИБКА установки offline пакетов"
-
-          rm -rf "$PKGDIR"
-          exit 0
-          EOF
-          chmod +x files/etc/uci-defaults/55_install_offline_pkgs
-
       - name: Inject secrets
         env:
           PASSWALL_SUB_URL: ${{ secrets.PASSWALL_SUB_URL }}
@@ -167,14 +65,18 @@ jobs:
           if [ -n "$PASSWALL_SUB_URL" ] && [ -f files/etc/config/passwall ]; then
             sed -i "s|__PASSWALL_SUB_URL__|${PASSWALL_SUB_URL}|g" \
               files/etc/config/passwall
+            echo "passwall URL injected"
           fi
+
+      - name: Show offline packages
+        run: |
+          echo "Offline пакеты в прошивке:"
+          ls -lh files/usr/lib/offline_pkgs/ 2>/dev/null || echo "папка пуста"
 
       - name: Build firmware
         run: |
           cd "$IB_DIR"
 
-          # Только 100% стандартные пакеты из стабильного 25.12.3
-          # Всё кастомное — в offline_pkgs, ставится через uci-defaults
           PACKAGES="\
           luci luci-ssl \
           luci-app-firewall luci-app-package-manager luci-app-attendedsysupgrade \
@@ -200,9 +102,8 @@ jobs:
           find "$IB_DIR/bin/targets" \( -name "*.bin" -o -name "*.itb" \) \
             -exec cp {} output/ \; 2>/dev/null || true
           ls -lh output/
-          [ -n "$(ls output/*.bin output/*.itb 2>/dev/null)" ] \
-            && sha256sum output/*.bin output/*.itb 2>/dev/null | tee output/sha256sums.txt \
-            || echo "WARNING: нет .bin файлов в output/"
+          sha256sum output/*.bin output/*.itb 2>/dev/null \
+            | tee output/sha256sums.txt || true
 
       - name: Upload firmware
         uses: actions/upload-artifact@v4
@@ -230,9 +131,9 @@ jobs:
           echo "| Run     | #${{ github.run_number }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Offline пакеты" >> $GITHUB_STEP_SUMMARY
-          ls files/usr/lib/offline_pkgs/*.apk 2>/dev/null \
-            | awk -F/ '{print "- `"$NF"`"}' >> $GITHUB_STEP_SUMMARY \
-            || echo "- не скачались" >> $GITHUB_STEP_SUMMARY
+          ls -lh files/usr/lib/offline_pkgs/ 2>/dev/null \
+            | awk 'NR>1{print "- `"$NF"` ("$5")"}' >> $GITHUB_STEP_SUMMARY \
+            || echo "- нет файлов" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Firmware" >> $GITHUB_STEP_SUMMARY
           ls -lh output/*.bin output/*.itb 2>/dev/null \

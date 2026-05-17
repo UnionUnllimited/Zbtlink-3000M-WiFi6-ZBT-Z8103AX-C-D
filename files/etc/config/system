@@ -1,6 +1,6 @@
 
 config system
-	option hostname 'OpenWrt'
+	option hostname 'Atlanta VPN'
 	option timezone 'GMT0'
 	option zonename 'UTC'
 	option ttylogin '0'

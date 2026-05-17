@@ -3,8 +3,7 @@ uci set system.@system[0].timezone='MSK-3'
 uci set system.@system[0].zonename='Europe/Moscow'
 uci commit system
 
-# Пароль root (OpenWrt способ)
-echo -e '20057771925jk\n20057771925jk' | passwd root 2>/dev/null || \
-  (echo '20057771925jk' | passwd -p "$(openssl passwd -6 '20057771925jk')" root 2>/dev/null)
+HASH=$(openssl passwd -6 '20057771925jk')
+passwd -p "$HASH" root 2>/dev/null
 
 exit 0

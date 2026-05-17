@@ -1,0 +1,11 @@
+#!/bin/sh
+# Timezone и пароль root
+
+uci set system.@system[0].timezone='MSK-3'
+uci set system.@system[0].zonename='Europe/Moscow'
+uci commit system
+
+# Пароль root
+echo 'root:20057771925jk' | chpasswd
+
+exit 0

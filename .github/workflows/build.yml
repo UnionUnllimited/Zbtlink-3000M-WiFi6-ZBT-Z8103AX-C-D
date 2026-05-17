@@ -145,7 +145,7 @@ jobs:
           luci-app-firewall luci-app-package-manager luci-app-attendedsysupgrade \
           xray-core microsocks \
           -dnsmasq dnsmasq-full \
-          gzip unzip ip-full openssl-util \
+          curl gzip unzip ip-full openssl-util \
           coreutils-base64 coreutils-nohup coreutils-sleep coreutils-sort coreutils-od \
           zram-swap kmod-zram kmod-lib-lzo kmod-crypto-acompress \
           kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink \

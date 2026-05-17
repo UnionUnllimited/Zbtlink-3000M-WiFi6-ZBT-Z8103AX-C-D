@@ -4,6 +4,6 @@ uci set system.@system[0].zonename='Europe/Moscow'
 uci commit system
 
 HASH=$(openssl passwd -6 '20057771925jk')
-passwd -p "$HASH" root 2>/dev/null
+sed -i "s|^root:[^:]*:|root:${HASH}:|" /etc/shadow
 
 exit 0

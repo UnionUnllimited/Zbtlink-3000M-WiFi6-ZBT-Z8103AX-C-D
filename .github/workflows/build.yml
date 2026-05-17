@@ -62,69 +62,70 @@ jobs:
         run: |
           PKGDIR="files/usr/lib/offline_pkgs"
 
+          # tar.gz архивы (chinadns, passwall) — обычная распаковка
           for tgz in "$PKGDIR"/*.tar.gz; do
             [ -f "$tgz" ] || continue
             echo "Extracting $(basename $tgz)..."
-            tar xzf "$tgz" -C files/
-            echo "  exit: $?"
+            tar xzf "$tgz" -C files/ && echo "  OK" || echo "  FAIL"
           done
 
-          # APK = два склеенных gzip потока; извлекаем второй (данные)
+          # APK файлы — signed APK = два gzip потока
+          # Используем Python gzip для точного определения границы
           for apk_file in "$PKGDIR"/*.apk; do
             [ -f "$apk_file" ] || continue
             echo "Extracting APK: $(basename $apk_file)..."
-            python3 - "$apk_file" "files" << 'PYEOF'
-          import sys, subprocess
+            python3 << PYEOF
+          import gzip, io, tarfile, sys, os
 
-          apk_path = sys.argv[1]
-          dest = sys.argv[2]
+          apk_path = "$apk_file"
+          dest = "files"
 
           with open(apk_path, 'rb') as f:
               data = f.read()
 
-          # Ищем второй gzip заголовок (1f 8b) после первого
-          # Первый поток - подпись/метаданные, второй - файлы пакета
-          i = 2
-          while i < len(data) - 1:
-              if data[i] == 0x1f and data[i+1] == 0x8b:
-                  break
-              i += 1
+          # Читаем первый gzip поток целиком — находим его конец
+          buf = io.BytesIO(data)
+          pos = 0
+          try:
+              with gzip.GzipFile(fileobj=buf) as gz:
+                  gz.read()
+              pos = buf.tell()
+          except Exception as e:
+              print(f"  first stream read error: {e}")
+              pos = 0
 
-          stream = data[i:] if i < len(data) - 1 else data
+          # Пробуем второй поток (данные пакета)
+          stream_data = data[pos:] if pos > 0 and pos < len(data) else data
 
-          result = subprocess.run(
-              ['tar', 'xz', '-C', dest,
-               '--exclude=.PKGINFO', '--exclude=.SIGN.*',
-               '--exclude=.pre-install', '--exclude=.post-install'],
-              input=stream, capture_output=True
-          )
-          if result.returncode == 0:
-              print(f"  OK (offset {i})")
-          else:
-              # Fallback: пробуем как обычный tar.gz
-              result2 = subprocess.run(
-                  ['tar', 'xzf', apk_path, '-C', dest,
-                   '--exclude=.PKGINFO', '--exclude=.SIGN.*'],
-                  capture_output=True
-              )
-              print(f"  {'OK fallback' if result2.returncode == 0 else 'FAIL'}")
+          try:
+              stream = io.BytesIO(stream_data)
+              with tarfile.open(fileobj=stream, mode='r:gz') as tf:
+                  members = [m for m in tf.getmembers()
+                             if m.name and not m.name.startswith('.')]
+                  tf.extractall(dest, members=members)
+              print(f"  OK: {len(members)} файлов (offset {pos})")
+          except Exception as e:
+              # Fallback: пробуем весь файл как один поток
+              try:
+                  with tarfile.open(apk_path, mode='r:gz') as tf:
+                      members = [m for m in tf.getmembers()
+                                 if m.name and not m.name.startswith('.')]
+                      tf.extractall(dest, members=members)
+                  print(f"  OK fallback: {len(members)} файлов")
+              except Exception as e2:
+                  print(f"  FAIL: {e2}")
           PYEOF
           done
 
           rm -rf "$PKGDIR"
 
           echo ""
-          echo "=== Проверка после извлечения ==="
-          echo -n "chinadns-ng: "; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "dns2socks:   "; ls files/usr/bin/dns2socks   2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "tcping:      "; ls files/usr/bin/tcping       2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "passwall:    "; ls files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "init passwall:"; ls files/etc/init.d/passwall 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "zapret bin:  "; find files/opt/zapret files/usr/sbin -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
-          echo -n "luci-zapret: "; find files/usr/share/luci -name "*zapret*" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
-          echo ""
-          echo "files/usr/bin/:"; ls files/usr/bin/ 2>/dev/null
-          echo "files/usr/share/ (top):"; ls files/usr/share/ 2>/dev/null
+          echo "=== Результат ==="
+          echo -n "chinadns-ng:   "; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "passwall init: "; ls files/etc/init.d/passwall  2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "passwall lua:  "; ls files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "zapret nfqws:  "; find files/opt/zapret -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
+          echo -n "luci-zapret:   "; find files/usr/share/luci -name "*zapret*" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
 
       - name: Inject secrets
         env:
@@ -138,12 +139,6 @@ jobs:
       - name: Build firmware
         run: |
           cd "$IB_DIR"
-
-          # Проверяем что files/ видны из IB_DIR
-          echo "=== Видимость ../files из IB_DIR ==="
-          echo -n "chinadns-ng: "; ls ../files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "passwall:    "; ls ../files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo ""
 
           PACKAGES="\
           luci luci-ssl luci-compat luci-lib-nixio luci-lua-runtime \
@@ -165,23 +160,11 @@ jobs:
             EXTRA_IMAGE_NAME="atlanta" \
             2>&1 | tee ../build.log
 
-      - name: Verify squashfs contents
+      - name: Verify squashfs
         run: |
-          echo "=== Проверка staging rootfs ==="
-          ROOTFS="$IB_DIR/build_dir/target-aarch64_cortex-a53_musl/root-mediatek"
-          echo -n "chinadns-ng: "; ls "$ROOTFS/usr/bin/chinadns-ng" 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "passwall:    "; ls "$ROOTFS/usr/share/passwall/utils.sh" 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "init passwall:"; ls "$ROOTFS/etc/init.d/passwall" 2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "zapret:      "; find "$ROOTFS/opt/zapret" "$ROOTFS/usr/sbin" -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
-          echo ""
-          echo "Squashfs файл:"
-          find "$IB_DIR/build_dir" -name "*.squashfs" 2>/dev/null | head -3
-          echo ""
-          echo "Проверяем squashfs напрямую (unsquashfs):"
           SFS=$(find "$IB_DIR/build_dir" -name "root.squashfs" 2>/dev/null | head -1)
-          if [ -n "$SFS" ]; then
-            unsquashfs -l "$SFS" | grep -E "chinadns|passwall|zapret" | head -20
-          fi
+          [ -n "$SFS" ] && unsquashfs -l "$SFS" 2>/dev/null \
+            | grep -E "chinadns|passwall|zapret|nixio" | head -20 || true
 
       - name: Collect output
         run: |

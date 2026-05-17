@@ -62,15 +62,12 @@ jobs:
         run: |
           PKGDIR="files/usr/lib/offline_pkgs"
 
-          # tar.gz архивы (chinadns, passwall) — обычная распаковка
           for tgz in "$PKGDIR"/*.tar.gz; do
             [ -f "$tgz" ] || continue
             echo "Extracting $(basename $tgz)..."
             tar xzf "$tgz" -C files/ && echo "  OK" || echo "  FAIL"
           done
 
-          # APK файлы — signed APK = два gzip потока
-          # Используем Python gzip для точного определения границы
           for apk_file in "$PKGDIR"/*.apk; do
             [ -f "$apk_file" ] || continue
             echo "Extracting APK: $(basename $apk_file)..."
@@ -83,7 +80,6 @@ jobs:
           with open(apk_path, 'rb') as f:
               data = f.read()
 
-          # Читаем первый gzip поток целиком — находим его конец
           buf = io.BytesIO(data)
           pos = 0
           try:
@@ -94,7 +90,6 @@ jobs:
               print(f"  first stream read error: {e}")
               pos = 0
 
-          # Пробуем второй поток (данные пакета)
           stream_data = data[pos:] if pos > 0 and pos < len(data) else data
 
           try:
@@ -105,7 +100,6 @@ jobs:
                   tf.extractall(dest, members=members)
               print(f"  OK: {len(members)} файлов (offset {pos})")
           except Exception as e:
-              # Fallback: пробуем весь файл как один поток
               try:
                   with tarfile.open(apk_path, mode='r:gz') as tf:
                       members = [m for m in tf.getmembers()
@@ -119,13 +113,23 @@ jobs:
 
           rm -rf "$PKGDIR"
 
-          echo ""
           echo "=== Результат ==="
           echo -n "chinadns-ng:   "; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
           echo -n "passwall init: "; ls files/etc/init.d/passwall  2>/dev/null && echo "OK" || echo "НЕТ"
-          echo -n "passwall lua:  "; ls files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
           echo -n "zapret nfqws:  "; find files/opt/zapret -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
           echo -n "luci-zapret:   "; find files/usr/share/luci -name "*zapret*" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
+
+      - name: Set file permissions
+        run: |
+          chmod +x files/usr/bin/apply_sub.sh            2>/dev/null || true
+          chmod +x files/usr/bin/frpc                    2>/dev/null || true
+          chmod +x files/usr/bin/youtube_strategy_autoselect.sh 2>/dev/null || true
+          chmod +x files/www/cgi-bin/mymacad             2>/dev/null || true
+          chmod +x files/www/cgi-bin/stats               2>/dev/null || true
+          chmod +x files/etc/uci-defaults/*              2>/dev/null || true
+          chmod +x files/etc/hotplug.d/*/*               2>/dev/null || true
+          chmod +x files/etc/init.d/*                    2>/dev/null || true
+          echo "Permissions set"
 
       - name: Inject secrets
         env:
@@ -134,6 +138,7 @@ jobs:
           if [ -n "$PASSWALL_SUB_URL" ] && [ -f files/etc/config/passwall ]; then
             sed -i "s|__PASSWALL_SUB_URL__|${PASSWALL_SUB_URL}|g" \
               files/etc/config/passwall
+            echo "passwall URL injected"
           fi
 
       - name: Build firmware
@@ -164,7 +169,7 @@ jobs:
         run: |
           SFS=$(find "$IB_DIR/build_dir" -name "root.squashfs" 2>/dev/null | head -1)
           [ -n "$SFS" ] && unsquashfs -l "$SFS" 2>/dev/null \
-            | grep -E "chinadns|passwall|zapret|nixio" | head -20 || true
+            | grep -E "chinadns|passwall|zapret|mymacad|apply_sub" | head -20 || true
 
       - name: Collect output
         run: |

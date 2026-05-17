@@ -146,7 +146,7 @@ jobs:
           echo ""
 
           PACKAGES="\
-          luci luci-ssl \
+          luci luci-ssl luci-compat luci-lib-nixio luci-lua-runtime \
           luci-app-firewall luci-app-package-manager luci-app-attendedsysupgrade \
           xray-core microsocks \
           -dnsmasq dnsmasq-full \
@@ -154,6 +154,7 @@ jobs:
           coreutils-base64 coreutils-nohup coreutils-sleep coreutils-sort coreutils-od \
           zram-swap kmod-zram kmod-lib-lzo kmod-crypto-acompress \
           kmod-nft-queue kmod-nfnetlink-queue kmod-nf-conntrack-netlink \
+          kmod-nf-socket kmod-nft-socket kmod-nf-tproxy kmod-nft-tproxy \
           libnetfilter-queue1 libnetfilter-conntrack3 \
           ubi-utils libyaml lyaml libbpf1 libelf1 libgmp10 libcap libnettle8"
 

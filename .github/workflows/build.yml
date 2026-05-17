@@ -35,7 +35,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            wget tar zstd build-essential rsync
+            wget tar zstd build-essential rsync squashfs-tools
 
       - name: Cache Image Builder
         id: cache-ib
@@ -58,51 +58,73 @@ jobs:
           tar --zstd -xf imagebuilder.tar.zst
           echo "IB_DIR=$(ls -d openwrt-imagebuilder-*/ | head -1 | sed 's|/$||')" >> $GITHUB_ENV
 
-      # ──────────────────────────────────────────────────────────────
-      # Распаковываем архивы с пакетами прямо в files/
-      # Файлы попадут в squashfs без какой-либо установки на роутере
-      # ──────────────────────────────────────────────────────────────
       - name: Extract offline packages into files/
         run: |
           PKGDIR="files/usr/lib/offline_pkgs"
 
-          # chinadns-ng, dns2socks, tcping
-          if [ -f "$PKGDIR/chinadns_dns_tcping.tar.gz" ]; then
-            echo "Extracting chinadns_dns_tcping.tar.gz..."
-            tar xzf "$PKGDIR/chinadns_dns_tcping.tar.gz" -C files/
-            echo "OK"
-          fi
-
-          # luci-app-passwall
-          if [ -f "$PKGDIR/luci_passwall.tar.gz" ]; then
-            echo "Extracting luci_passwall.tar.gz..."
-            tar xzf "$PKGDIR/luci_passwall.tar.gz" -C files/
-            echo "OK"
-          fi
-
-          # zapret .apk — APK это gzip tar, распаковываем как обычный архив
-          for apk_file in "$PKGDIR"/*.apk; do
-            [ -f "$apk_file" ] || continue
-            echo "Extracting $(basename $apk_file)..."
-            # APK файл = gzip tar с папками usr/, etc/, lib/ и .PKGINFO
-            tar xzf "$apk_file" -C files/ \
-              --exclude='.PKGINFO' \
-              --exclude='.SIGN.*' \
-              --exclude='.INSTALL' \
-              2>/dev/null && echo "  OK" || echo "  WARN: some files skipped"
+          for tgz in "$PKGDIR"/*.tar.gz; do
+            [ -f "$tgz" ] || continue
+            echo "Extracting $(basename $tgz)..."
+            tar xzf "$tgz" -C files/
+            echo "  exit: $?"
           done
 
-          # Удаляем папку с архивами — она больше не нужна в прошивке
+          # APK = два склеенных gzip потока; извлекаем второй (данные)
+          for apk_file in "$PKGDIR"/*.apk; do
+            [ -f "$apk_file" ] || continue
+            echo "Extracting APK: $(basename $apk_file)..."
+            python3 - "$apk_file" "files" << 'PYEOF'
+          import sys, subprocess
+
+          apk_path = sys.argv[1]
+          dest = sys.argv[2]
+
+          with open(apk_path, 'rb') as f:
+              data = f.read()
+
+          # Ищем второй gzip заголовок (1f 8b) после первого
+          # Первый поток - подпись/метаданные, второй - файлы пакета
+          i = 2
+          while i < len(data) - 1:
+              if data[i] == 0x1f and data[i+1] == 0x8b:
+                  break
+              i += 1
+
+          stream = data[i:] if i < len(data) - 1 else data
+
+          result = subprocess.run(
+              ['tar', 'xz', '-C', dest,
+               '--exclude=.PKGINFO', '--exclude=.SIGN.*',
+               '--exclude=.pre-install', '--exclude=.post-install'],
+              input=stream, capture_output=True
+          )
+          if result.returncode == 0:
+              print(f"  OK (offset {i})")
+          else:
+              # Fallback: пробуем как обычный tar.gz
+              result2 = subprocess.run(
+                  ['tar', 'xzf', apk_path, '-C', dest,
+                   '--exclude=.PKGINFO', '--exclude=.SIGN.*'],
+                  capture_output=True
+              )
+              print(f"  {'OK fallback' if result2.returncode == 0 else 'FAIL'}")
+          PYEOF
+          done
+
           rm -rf "$PKGDIR"
 
           echo ""
-          echo "=== Результат ==="
-          echo "chinadns-ng:"; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "  OK" || echo "  НЕТ"
-          echo "dns2socks:";   ls files/usr/bin/dns2socks 2>/dev/null && echo "  OK" || echo "  НЕТ"
-          echo "tcping:";      ls files/usr/bin/tcping 2>/dev/null && echo "  OK" || echo "  НЕТ"
-          echo "passwall:";    ls files/usr/share/passwall 2>/dev/null && echo "  OK" || echo "  НЕТ"
-          echo "zapret:";      ls files/opt/zapret 2>/dev/null && echo "  OK" || ls files/usr/sbin/zapret 2>/dev/null && echo "  OK" || echo "  НЕТ"
-          echo "luci-zapret:"; ls files/usr/share/luci/menu.d/*zapret* 2>/dev/null && echo "  OK" || echo "  НЕТ"
+          echo "=== Проверка после извлечения ==="
+          echo -n "chinadns-ng: "; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "dns2socks:   "; ls files/usr/bin/dns2socks   2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "tcping:      "; ls files/usr/bin/tcping       2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "passwall:    "; ls files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "init passwall:"; ls files/etc/init.d/passwall 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "zapret bin:  "; find files/opt/zapret files/usr/sbin -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
+          echo -n "luci-zapret: "; find files/usr/share/luci -name "*zapret*" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
+          echo ""
+          echo "files/usr/bin/:"; ls files/usr/bin/ 2>/dev/null
+          echo "files/usr/share/ (top):"; ls files/usr/share/ 2>/dev/null
 
       - name: Inject secrets
         env:
@@ -111,12 +133,17 @@ jobs:
           if [ -n "$PASSWALL_SUB_URL" ] && [ -f files/etc/config/passwall ]; then
             sed -i "s|__PASSWALL_SUB_URL__|${PASSWALL_SUB_URL}|g" \
               files/etc/config/passwall
-            echo "passwall URL injected"
           fi
 
       - name: Build firmware
         run: |
           cd "$IB_DIR"
+
+          # Проверяем что files/ видны из IB_DIR
+          echo "=== Видимость ../files из IB_DIR ==="
+          echo -n "chinadns-ng: "; ls ../files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "passwall:    "; ls ../files/usr/share/passwall/utils.sh 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo ""
 
           PACKAGES="\
           luci luci-ssl \
@@ -136,6 +163,24 @@ jobs:
             FILES="../files" \
             EXTRA_IMAGE_NAME="atlanta" \
             2>&1 | tee ../build.log
+
+      - name: Verify squashfs contents
+        run: |
+          echo "=== Проверка staging rootfs ==="
+          ROOTFS="$IB_DIR/build_dir/target-aarch64_cortex-a53_musl/root-mediatek"
+          echo -n "chinadns-ng: "; ls "$ROOTFS/usr/bin/chinadns-ng" 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "passwall:    "; ls "$ROOTFS/usr/share/passwall/utils.sh" 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "init passwall:"; ls "$ROOTFS/etc/init.d/passwall" 2>/dev/null && echo "OK" || echo "НЕТ"
+          echo -n "zapret:      "; find "$ROOTFS/opt/zapret" "$ROOTFS/usr/sbin" -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
+          echo ""
+          echo "Squashfs файл:"
+          find "$IB_DIR/build_dir" -name "*.squashfs" 2>/dev/null | head -3
+          echo ""
+          echo "Проверяем squashfs напрямую (unsquashfs):"
+          SFS=$(find "$IB_DIR/build_dir" -name "root.squashfs" 2>/dev/null | head -1)
+          if [ -n "$SFS" ]; then
+            unsquashfs -l "$SFS" | grep -E "chinadns|passwall|zapret" | head -20
+          fi
 
       - name: Collect output
         run: |

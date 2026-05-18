@@ -117,19 +117,50 @@ jobs:
           echo -n "chinadns-ng:   "; ls files/usr/bin/chinadns-ng 2>/dev/null && echo "OK" || echo "НЕТ"
           echo -n "passwall init: "; ls files/etc/init.d/passwall  2>/dev/null && echo "OK" || echo "НЕТ"
           echo -n "zapret nfqws:  "; find files/opt/zapret -name "nfqws" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
-          echo -n "luci-zapret:   "; find files/usr/share/luci -name "*zapret*" 2>/dev/null | head -1 | grep -q . && echo "OK" || echo "НЕТ"
 
-      - name: Set file permissions
+      - name: Patch api.lua
         run: |
-          chmod +x files/usr/bin/apply_sub.sh            2>/dev/null || true
-          chmod +x files/usr/bin/frpc                    2>/dev/null || true
+          python3 << 'EOF'
+          path = "files/usr/lib/lua/luci/passwall/api.lua"
+          try:
+              with open(path, "r") as f:
+                  content = f.read()
+              old = 'return (version or ""):gsub("\\n", ""):match("^([^-]+)")'
+              new = 'return (version or ""):gsub("\\n", ""):match("^([^-]+)") or "0"'
+              if old in content:
+                  with open(path, "w") as f:
+                      f.write(content.replace(old, new))
+                  print("api.lua patched OK")
+              else:
+                  print("Pattern not found - already patched or different version")
+          except Exception as e:
+              print(f"Error: {e}")
+          EOF
+
+      - name: Fix CRLF and set permissions
+        run: |
+          # Убираем Windows окончания строк из всех скриптов
+          find files/ -type f \( \
+            -name "*.sh" \
+            -o -name "mymacad" \
+            -o -name "stats" \
+            -o -path "*/uci-defaults/*" \
+            -o -path "*/init.d/*" \
+            -o -path "*/hotplug.d/*/*" \
+            -o -name "apply_sub.sh" \
+          \) -exec sed -i 's/\r//' {} \;
+
+          # Выставляем права на исполнение
+          chmod +x files/usr/bin/apply_sub.sh                   2>/dev/null || true
+          chmod +x files/usr/bin/frpc                           2>/dev/null || true
           chmod +x files/usr/bin/youtube_strategy_autoselect.sh 2>/dev/null || true
-          chmod +x files/www/cgi-bin/mymacad             2>/dev/null || true
-          chmod +x files/www/cgi-bin/stats               2>/dev/null || true
-          chmod +x files/etc/uci-defaults/*              2>/dev/null || true
-          chmod +x files/etc/hotplug.d/*/*               2>/dev/null || true
-          chmod +x files/etc/init.d/*                    2>/dev/null || true
-          echo "Permissions set"
+          chmod +x files/www/cgi-bin/mymacad                    2>/dev/null || true
+          chmod +x files/www/cgi-bin/stats                      2>/dev/null || true
+          chmod +x files/etc/uci-defaults/*                     2>/dev/null || true
+          chmod +x files/etc/hotplug.d/*/*                      2>/dev/null || true
+          chmod +x files/etc/init.d/*                           2>/dev/null || true
+
+          echo "CRLF fix and permissions done"
 
       - name: Inject secrets
         env:
@@ -169,7 +200,7 @@ jobs:
         run: |
           SFS=$(find "$IB_DIR/build_dir" -name "root.squashfs" 2>/dev/null | head -1)
           [ -n "$SFS" ] && unsquashfs -l "$SFS" 2>/dev/null \
-            | grep -E "chinadns|passwall|zapret|mymacad|apply_sub" | head -20 || true
+            | grep -E "chinadns|passwall|zapret|mymacad|apply_sub|api.lua" | head -20 || true
 
       - name: Collect output
         run: |
